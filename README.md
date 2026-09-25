@@ -144,6 +144,36 @@ pveum aclmod /vms -token 'svc-vmctl@pve!automatitzacio' -role VMCtl
 
 La VM es pot indicar pel **nom** o pel **vmid**. Si un nom es repeteix, feu servir el vmid.
 
+### Diverses VMs a la vegada (`--parallel`)
+
+Tots els subcomandaments accepten **una o més VMs**. Per defecte s'actua sobre una darrere l'altra;
+amb `--parallel N`, fins a N alhora (l'opció va **abans** del subcomandament, com les altres):
+
+```bash
+./pvectl.py start web01 web02 web03                       # en sèrie
+./pvectl.py --parallel 4 start web01 web02 web03 web04    # fins a 4 alhora
+./pvectl.py --parallel 3 snapshot web01 web02 web03 pre-update   # el NOM és l'últim argument
+./pvectl.py --parallel 3 snapshot web01 web02 web03 nocturn --keep 7
+./pvectl.py status 101 102 103
+./pvectl.py --yes delsnap web01 web02 pre-update
+```
+
+- **Snapshot, rollback i delsnap** tenen la forma `VM [VM...] NOM`: l'**últim argument és el nom
+  del snapshot** i la resta són VMs. Les opcions del subcomandament (`--desc`, `--keep`...) van
+  després. Amb una sola VM funciona exactament com abans.
+- **Tot o res en la validació:** primer es resolen totes les VMs amb una sola consulta al clúster.
+  Si alguna no existeix o el nom és ambigu, no es fa **res**.
+- **Un error no atura les altres:** cada VM es reporta per separat (`OK: ...` o `ERROR: ...`), al
+  final surt un resum, i el codi de sortida és **1** si alguna ha fallat (útil per a cron i scripts).
+- **Confirmació:** `stop`, `reset`, `rollback` i `delsnap` sobre **més d'una** VM demanen
+  confirmació. Sense terminal (cron, scripts) cal `--yes`; si no, es nega a fer-ho. Amb una sola VM
+  no es demana mai.
+- Amb `--parallel`, les línies surten en l'ordre en què cada VM acaba, no en l'ordre de la línia
+  d'ordres. Els duplicats (per exemple un nom i el seu vmid) es tracten com una sola VM.
+- Amb `--keep`, totes les VMs reben **el mateix nom** de snapshot (mateix sufix de data) i cada una
+  es rota pel seu compte.
+- Cada VM té els seus propis reintents per bloqueig; el paral·lelisme no els afecta.
+
 Per defecte l'script espera que la tasca acabi i falla si no ha anat bé. Amb `--no-wait`
 retorna l'UPID immediatament (l'opció va **abans** del subcomandament):
 

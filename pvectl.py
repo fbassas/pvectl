@@ -7,6 +7,9 @@ Nodes del clúster (es proven en ordre; si un no respon es passa al següent), p
   PVE_HOSTS                    variable d'entorn, separats per comes
   (-h i -f es poden combinar; van sempre abans del subcomandament; l'ajuda és --help)
 
+Diverses VM: es poden indicar totes les VM/CT que es vulguin (nom o vmid). Per defecte
+s'actua sobre una darrere l'altra; amb --parallel N, fins a N alhora.
+
 Variables d'entorn:
   PVE_HOSTS    nodes separats per comes, p.ex. pve01.example.org,pve02.example.org
   PVE_TOKEN    usuari@realm!idtoken=secret
@@ -20,12 +23,13 @@ Exemples:
   pvectl.py -f nodes.txt list
   pvectl.py list
   pvectl.py start web01
+  pvectl.py --parallel 4 start web01 web02 web03 web04
   pvectl.py shutdown 105
   pvectl.py snapshot web01 pre-update --desc "abans d'actualitzar" [--vmstate]
-  pvectl.py snapshot web01 nocturn --keep 2   # crea nocturn-AAAAMMDD-HHMMSS i en conserva només 2
+  pvectl.py --parallel 3 snapshot web01 web02 web03 nocturn --keep 2   # el NOM és l'últim argument
   pvectl.py snapshots web01
   pvectl.py rollback web01 pre-update
-  pvectl.py delsnap web01 pre-update
+  pvectl.py --yes delsnap web01 web02 pre-update
 """
 import argparse
 import json
@@ -33,19 +37,29 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 POWER_ACTIONS = ("start", "stop", "shutdown", "reboot", "reset", "suspend", "resume")
+# Accions que, sobre més d'una VM, exigeixen confirmació (o --yes)
+DESTRUCTIVE = ("stop", "reset", "rollback", "delsnap")
+# Subcomandaments amb la forma "VM [VM...] NOM": el nom és l'últim argument
+NAMED = ("snapshot", "rollback", "delsnap")
 DEFAULT_TOKEN_FILE = os.path.expanduser("~/.config/pvectl/token")
 # Errors transitoris de bloqueig de la VM (una altra tasca hi treballa): l'operació no s'ha
 # arribat a executar, així que és segur tornar-ho a provar.
 LOCK_ERRORS = ("can't lock file", "is locked")
 
 
-class ApiError(Exception):
+class PveError(Exception):
+    """Error d'una operació contra el clúster (es reporta per VM, sense aturar les altres)."""
+
+
+class ApiError(PveError):
     """Error HTTP retornat per l'API de Proxmox."""
 
     def __init__(self, code, host, body):
@@ -53,13 +67,25 @@ class ApiError(Exception):
         self.body = body
 
 
-class TaskFailed(Exception):
+class TaskFailed(PveError):
     """Una tasca de Proxmox ha acabat amb un exitstatus diferent d'OK."""
+
+    def __init__(self, status):
+        super().__init__(f"tasca fallida: {status}")
 
 
 def is_lock_error(exc):
     msg = exc.body if isinstance(exc, ApiError) else str(exc)
     return any(s in msg for s in LOCK_ERRORS)
+
+
+_print_lock = threading.Lock()
+
+
+def say(msg, err=False):
+    """Imprimeix una línia sencera sense que es barregi amb la d'un altre fil."""
+    with _print_lock:
+        print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 
 def load_token():
@@ -131,17 +157,23 @@ class Pve:
                 raise ApiError(e.code, host, e.read().decode(errors="replace"))
             except (urllib.error.URLError, OSError) as e:
                 last = e  # node caigut o inaccessible: provem el següent
-        sys.exit(f"Cap node accessible ({last})")
+        raise PveError(f"Cap node accessible ({last})")
 
-    def find(self, ident):
-        vms = self.call("GET", "/cluster/resources")
-        vms = [v for v in vms if v.get("type") in ("qemu", "lxc")]
-        hits = [v for v in vms if str(v["vmid"]) == ident or v.get("name") == ident]
-        if not hits:
-            sys.exit(f"No trobo cap VM/CT amb vmid o nom '{ident}'")
-        if len(hits) > 1:
-            sys.exit(f"'{ident}' és ambigu: vmids {[v['vmid'] for v in hits]}. Feu servir el vmid.")
-        return hits[0]
+    def find_all(self, idents):
+        """Resol tots els noms/vmids en una sola consulta. Tot o res: si un falla, no es fa res."""
+        vms = [v for v in self.call("GET", "/cluster/resources") if v.get("type") in ("qemu", "lxc")]
+        found, errors = {}, []
+        for ident in idents:
+            hits = [v for v in vms if str(v["vmid"]) == ident or v.get("name") == ident]
+            if not hits:
+                errors.append(f"No trobo cap VM/CT amb vmid o nom '{ident}'")
+            elif len(hits) > 1:
+                errors.append(f"'{ident}' és ambigu: vmids {[v['vmid'] for v in hits]}. Feu servir el vmid.")
+            else:
+                found.setdefault(hits[0]["vmid"], hits[0])  # sense duplicats, mantenint l'ordre
+        if errors:
+            sys.exit("\n".join(errors))
+        return list(found.values())
 
     def wait(self, node, upid, timeout=600):
         end = time.time() + timeout
@@ -152,9 +184,9 @@ class Pve:
                     raise TaskFailed(st.get("exitstatus"))
                 return
             time.sleep(2)
-        sys.exit("Temps d'espera esgotat (la tasca pot continuar al clúster)")
+        raise PveError("temps d'espera esgotat (la tasca pot continuar al clúster)")
 
-    def run_task(self, node, method, path, params=None, wait=True, retries=5, delay=10):
+    def run_task(self, node, method, path, params=None, wait=True, retries=5, delay=10, label=""):
         """Llança una operació i (si wait) n'espera el resultat.
 
         Si la VM està bloquejada per una altra tasca, reintenta fins a `retries` cops
@@ -169,8 +201,8 @@ class Pve:
             except (ApiError, TaskFailed) as e:
                 if not is_lock_error(e) or attempt == retries:
                     raise
-                print(f"VM bloquejada per una altra tasca; reintent {attempt + 1}/{retries} "
-                      f"d'aquí a {delay}s...", file=sys.stderr)
+                say(f"{label}VM bloquejada per una altra tasca; reintent {attempt + 1}/{retries} "
+                    f"d'aquí a {delay}s...", err=True)
                 time.sleep(delay)
 
 
@@ -180,22 +212,31 @@ SNAP_SUFFIX_LEN = len("-AAAAMMDD-HHMMSS")
 SNAP_NAME_MAX = 40  # llargada màxima del nom d'un snapshot a Proxmox
 
 
-def prune_snapshots(pve, vm, base, prefix, keep, retries, delay):
+def prune_snapshots(pve, vm, base, prefix, keep, retries, delay, label=""):
     """Esborra els snapshots '<prefix>-AAAAMMDD-HHMMSS' més antics, deixant-ne `keep`."""
     pat = re.compile(re.escape(prefix) + r"-\d{8}-\d{6}$")
     group = sorted(s["name"] for s in pve.call("GET", f"{base}/snapshot") if pat.match(s["name"]))
     for old in group[:-keep]:
-        pve.run_task(vm["node"], "DELETE", f"{base}/snapshot/{old}", retries=retries, delay=delay)
-        print(f"Esborrat snapshot antic: {old}")
+        pve.run_task(vm["node"], "DELETE", f"{base}/snapshot/{old}",
+                     retries=retries, delay=delay, label=label)
+        say(f"{label}Esborrat snapshot antic: {old}")
+
+
+def confirm_destructive(cmd, vms):
+    """Demana confirmació (només en interactiu) abans d'una acció destructiva sobre diverses VM."""
+    names = ", ".join(f"{v['vmid']} ({v.get('name')})" for v in vms)
+    if not sys.stdin.isatty():
+        sys.exit(f"'{cmd}' sobre {len(vms)} VMs requereix --yes (no hi ha terminal per confirmar-ho).")
+    print(f"S'executarà '{cmd}' sobre {len(vms)} VMs: {names}")
+    if input("Continuar? [s/N] ").strip().lower() not in ("s", "si", "sí", "y", "yes"):
+        sys.exit("Cancel·lat.")
 
 
 def main():
     try:
         run()
-    except ApiError as e:
+    except PveError as e:
         sys.exit(str(e))
-    except TaskFailed as e:
-        sys.exit(f"Tasca fallida: {e}")
 
 
 def run():
@@ -207,6 +248,10 @@ def run():
     ap.add_argument("-f", "--hosts-file", metavar="FITXER",
                     help="fitxer de text amb un node per línia (# = comentari)")
     ap.add_argument("--no-wait", action="store_true", help="no esperis que acabi la tasca")
+    ap.add_argument("--parallel", type=int, default=1, metavar="N",
+                    help="nombre de VMs a tractar alhora (defecte: 1, una darrere l'altra)")
+    ap.add_argument("--yes", action="store_true",
+                    help="no demanis confirmació per a accions destructives sobre diverses VMs")
     ap.add_argument("--retries", type=int, default=5, metavar="N",
                     help="reintents si la VM està bloquejada per una altra tasca (defecte: 5)")
     ap.add_argument("--retry-delay", type=int, default=10, metavar="SEGONS",
@@ -214,19 +259,27 @@ def run():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
     for c in POWER_ACTIONS + ("status", "snapshots"):
-        sub.add_parser(c).add_argument("vm")
-    p = sub.add_parser("snapshot")
-    p.add_argument("vm"); p.add_argument("name")
+        sub.add_parser(c).add_argument("vm", nargs="+", metavar="VM")
+    subs = {}
+    for c in NAMED:
+        subs[c] = p = sub.add_parser(c)
+        p.add_argument("args", nargs="+", metavar="VM... NOM",
+                       help="una o més VMs (nom o vmid) i, al final, el nom del snapshot")
+    p = subs["snapshot"]
     p.add_argument("--desc", default="")
     p.add_argument("--vmstate", action="store_true", help="inclou la RAM (només qemu)")
     p.add_argument("--keep", type=int, metavar="N",
                    help="rotació: el nom és un prefix, s'hi afegeix la data (nom-AAAAMMDD-HHMMSS) "
                         "i es conserven només els N snapshots més recents d'aquest prefix")
-    for c in ("rollback", "delsnap"):
-        p = sub.add_parser(c)
-        p.add_argument("vm"); p.add_argument("name")
     a = ap.parse_args()
 
+    if a.cmd in NAMED:
+        if len(a.args) < 2:
+            subs[a.cmd].error("cal indicar almenys una VM i el nom del snapshot (VM... NOM)")
+        a.vm, a.name = a.args[:-1], a.args[-1]
+
+    if a.parallel < 1:
+        sys.exit("--parallel ha de ser 1 o més.")
     keep = getattr(a, "keep", None)
     if keep is not None:
         if keep < 1:
@@ -244,43 +297,74 @@ def run():
             print(f"{v['vmid']:>6}  {v.get('name', '-'):<30} {v['type']:<5} {v.get('status', '?'):<9} {v['node']}")
         return
 
-    vm = pve.find(a.vm)
-    base = f"/nodes/{vm['node']}/{vm['type']}/{vm['vmid']}"
+    vms = pve.find_all(a.vm)
+    many = len(vms) > 1
+    if many and a.cmd in DESTRUCTIVE and not a.yes:
+        confirm_destructive(a.cmd, vms)
 
-    if a.cmd == "status":
-        s = pve.call("GET", f"{base}/status/current")
-        print(f"{vm['vmid']} {s.get('name')} @ {vm['node']}: {s['status']}")
-        return
-    if a.cmd == "snapshots":
-        for s in pve.call("GET", f"{base}/snapshot"):
-            if s["name"] == "current":  # pseudo-entrada de Proxmox ("You are here!"), no és un snapshot
-                continue
-            print(f"{s['name']:<30} {s.get('description', '')}")
-        return
+    # Un sol sufix per a tota l'execució: totes les VMs reben el mateix nom de snapshot
+    snapname = getattr(a, "name", None)
+    if keep is not None:
+        snapname = f"{a.name}-{time.strftime('%Y%m%d-%H%M%S')}"
 
-    params = None
-    if a.cmd in POWER_ACTIONS:
-        method, path = "POST", f"{base}/status/{a.cmd}"
-    elif a.cmd == "snapshot":
-        method, path = "POST", f"{base}/snapshot"
-        snapname = a.name if keep is None else f"{a.name}-{time.strftime('%Y%m%d-%H%M%S')}"
-        params = {"snapname": snapname, "description": a.desc}
-        if a.vmstate:
-            params["vmstate"] = 1
-    elif a.cmd == "rollback":
-        method, path = "POST", f"{base}/snapshot/{a.name}/rollback"
-    elif a.cmd == "delsnap":
-        method, path = "DELETE", f"{base}/snapshot/{a.name}"
+    def work(vm):
+        """Fa l'operació sobre una VM. Retorna True si ha anat bé; els errors es reporten aquí."""
+        label = f"{vm['vmid']} ({vm.get('name')})"
+        prefix = f"[{label}] " if many else ""
+        base = f"/nodes/{vm['node']}/{vm['type']}/{vm['vmid']}"
+        try:
+            if a.cmd == "status":
+                s = pve.call("GET", f"{base}/status/current")
+                say(f"{vm['vmid']} {s.get('name')} @ {vm['node']}: {s['status']}")
+                return True
+            if a.cmd == "snapshots":
+                # 'current' és una pseudo-entrada de Proxmox ("You are here!"), no un snapshot
+                lines = [f"{s['name']:<30} {s.get('description', '')}"
+                         for s in pve.call("GET", f"{base}/snapshot") if s["name"] != "current"]
+                if many:
+                    lines.insert(0, f"== {label} @ {vm['node']}")
+                if lines:
+                    say("\n".join(lines))
+                return True
 
-    upid = pve.run_task(vm["node"], method, path, params, wait=not a.no_wait,
-                        retries=a.retries, delay=a.retry_delay)
-    if a.no_wait or not upid:
-        print(f"Tasca enviada: {upid}")
+            params = None
+            if a.cmd in POWER_ACTIONS:
+                method, path = "POST", f"{base}/status/{a.cmd}"
+            elif a.cmd == "snapshot":
+                method, path = "POST", f"{base}/snapshot"
+                params = {"snapname": snapname, "description": a.desc}
+                if a.vmstate:
+                    params["vmstate"] = 1
+            elif a.cmd == "rollback":
+                method, path = "POST", f"{base}/snapshot/{a.name}/rollback"
+            elif a.cmd == "delsnap":
+                method, path = "DELETE", f"{base}/snapshot/{a.name}"
+
+            upid = pve.run_task(vm["node"], method, path, params, wait=not a.no_wait,
+                                retries=a.retries, delay=a.retry_delay, label=prefix)
+            if a.no_wait or not upid:
+                say(f"Tasca enviada: {a.cmd} {label} a {vm['node']}: {upid}")
+            else:
+                what = f"{a.cmd} '{snapname}'" if keep is not None else a.cmd
+                say(f"OK: {what} {label} a {vm['node']}")
+                if keep is not None:
+                    prune_snapshots(pve, vm, base, a.name, keep, a.retries, a.retry_delay, prefix)
+            return True
+        except PveError as e:
+            say(f"ERROR: {a.cmd} {label}: {e}", err=True)
+            return False
+
+    if a.parallel == 1 or not many:
+        results = [work(vm) for vm in vms]
     else:
-        what = f"{a.cmd} '{snapname}'" if keep is not None else a.cmd
-        print(f"OK: {what} {vm['vmid']} ({vm.get('name')}) a {vm['node']}")
-        if keep is not None:
-            prune_snapshots(pve, vm, base, a.name, keep, a.retries, a.retry_delay)
+        with ThreadPoolExecutor(max_workers=min(a.parallel, len(vms))) as ex:
+            results = list(ex.map(work, vms))
+
+    failed = results.count(False)
+    if many and (failed or a.cmd not in ("status", "snapshots")):  # a les consultes només si hi ha errors
+        say(f"Resum: {len(vms) - failed} correctes, {failed} amb error", err=bool(failed))
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
