@@ -8,7 +8,9 @@ Nodes del clúster (es proven en ordre; si un no respon es passa al següent), p
   (-h i -f es poden combinar; van sempre abans del subcomandament; l'ajuda és --help)
 
 Diverses VM: es poden indicar totes les VM/CT que es vulguin (nom o vmid). Per defecte
-s'actua sobre una darrere l'altra; amb --parallel N, fins a N alhora.
+s'actua sobre una darrere l'altra; amb --parallel N, fins a N alhora. També es poden seleccionar
+per patró (--match 'k8s-*', es pot repetir; exclou les plantilles) o per fitxer (--vms-file, un nom
+o vmid per línia). Tot es pot combinar; van abans del subcomandament.
 
 Variables d'entorn:
   PVE_HOSTS    nodes separats per comes, p.ex. pve01.example.org,pve02.example.org
@@ -27,11 +29,15 @@ Exemples:
   pvectl.py shutdown 105
   pvectl.py snapshot web01 pre-update --desc "abans d'actualitzar" [--vmstate]
   pvectl.py --parallel 3 snapshot web01 web02 web03 nocturn --keep 2   # el NOM és l'últim argument
+  pvectl.py --match 'k8s-*' --parallel 4 shutdown
+  pvectl.py --match 'web*' snapshot nocturn --keep 7
+  pvectl.py --vms-file vms.txt status
   pvectl.py snapshots web01
   pvectl.py rollback web01 pre-update
   pvectl.py --yes delsnap web01 web02 pre-update
 """
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -159,8 +165,12 @@ class Pve:
                 last = e  # node caigut o inaccessible: provem el següent
         raise PveError(f"Cap node accessible ({last})")
 
-    def find_all(self, idents):
-        """Resol tots els noms/vmids en una sola consulta. Tot o res: si un falla, no es fa res."""
+    def find_all(self, idents, patterns=()):
+        """Resol noms/vmids i patrons en una sola consulta. Tot o res: si un falla, no es fa res.
+
+        Primer van les VMs indicades explícitament (en ordre) i després les dels patrons (per vmid).
+        Els patrons no inclouen plantilles.
+        """
         vms = [v for v in self.call("GET", "/cluster/resources") if v.get("type") in ("qemu", "lxc")]
         found, errors = {}, []
         for ident in idents:
@@ -171,6 +181,13 @@ class Pve:
                 errors.append(f"'{ident}' és ambigu: vmids {[v['vmid'] for v in hits]}. Feu servir el vmid.")
             else:
                 found.setdefault(hits[0]["vmid"], hits[0])  # sense duplicats, mantenint l'ordre
+        for pat in patterns:
+            hits = [v for v in sorted(vms, key=lambda v: v["vmid"])
+                    if not v.get("template") and fnmatch.fnmatchcase(v.get("name", ""), pat)]
+            if not hits:
+                errors.append(f"Cap VM/CT (que no sigui plantilla) coincideix amb el patró '{pat}'")
+            for v in hits:
+                found.setdefault(v["vmid"], v)
         if errors:
             sys.exit("\n".join(errors))
         return list(found.values())
@@ -222,6 +239,15 @@ def prune_snapshots(pve, vm, base, prefix, keep, retries, delay, label=""):
         say(f"{label}Esborrat snapshot antic: {old}")
 
 
+def read_vms_file(path):
+    """Llegeix un fitxer amb una VM (nom o vmid) per línia; ignora buides i comentaris (#)."""
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return [l for l in (line.split("#", 1)[0].strip() for line in f) if l]
+    except OSError as e:
+        sys.exit(f"No puc llegir el fitxer de VMs ({path}): {e.strerror}")
+
+
 def confirm_destructive(cmd, vms):
     """Demana confirmació (només en interactiu) abans d'una acció destructiva sobre diverses VM."""
     names = ", ".join(f"{v['vmid']} ({v.get('name')})" for v in vms)
@@ -247,6 +273,11 @@ def run():
                     help="nodes del clúster separats per comes (es pot repetir)")
     ap.add_argument("-f", "--hosts-file", metavar="FITXER",
                     help="fitxer de text amb un node per línia (# = comentari)")
+    ap.add_argument("--match", action="append", metavar="PATRÓ",
+                    help="selecciona les VMs el nom de les quals coincideix amb el patró (p.ex. 'k8s-*'; "
+                         "es pot repetir; exclou plantilles; citeu-lo perquè la shell no l'expandeixi)")
+    ap.add_argument("--vms-file", metavar="FITXER",
+                    help="fitxer amb una VM (nom o vmid) per línia (# = comentari)")
     ap.add_argument("--no-wait", action="store_true", help="no esperis que acabi la tasca")
     ap.add_argument("--parallel", type=int, default=1, metavar="N",
                     help="nombre de VMs a tractar alhora (defecte: 1, una darrere l'altra)")
@@ -258,13 +289,16 @@ def run():
                     help="espera entre reintents (defecte: 10)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
-    for c in POWER_ACTIONS + ("status", "snapshots"):
-        sub.add_parser(c).add_argument("vm", nargs="+", metavar="VM")
     subs = {}
+    for c in POWER_ACTIONS + ("status", "snapshots"):
+        subs[c] = sub.add_parser(c)
+        subs[c].add_argument("vm", nargs="*", metavar="VM",
+                             help="VMs (nom o vmid); opcional si s'usa --match o --vms-file")
     for c in NAMED:
         subs[c] = p = sub.add_parser(c)
-        p.add_argument("args", nargs="+", metavar="VM... NOM",
-                       help="una o més VMs (nom o vmid) i, al final, el nom del snapshot")
+        p.add_argument("args", nargs="*", metavar="VM... NOM",
+                       help="VMs (nom o vmid) i, al final, el nom del snapshot; "
+                            "amb --match o --vms-file només cal el nom")
     p = subs["snapshot"]
     p.add_argument("--desc", default="")
     p.add_argument("--vmstate", action="store_true", help="inclou la RAM (només qemu)")
@@ -273,10 +307,14 @@ def run():
                         "i es conserven només els N snapshots més recents d'aquest prefix")
     a = ap.parse_args()
 
+    selectors = bool(a.match or a.vms_file)  # VMs triades per patró o fitxer, no a la línia d'ordres
     if a.cmd in NAMED:
-        if len(a.args) < 2:
-            subs[a.cmd].error("cal indicar almenys una VM i el nom del snapshot (VM... NOM)")
+        if len(a.args) < (1 if selectors else 2):
+            subs[a.cmd].error("cal indicar el nom del snapshot i, si no s'usa --match ni --vms-file, "
+                              "almenys una VM (VM... NOM)")
         a.vm, a.name = a.args[:-1], a.args[-1]
+    elif a.cmd != "list" and not a.vm and not selectors:
+        subs[a.cmd].error("cal indicar almenys una VM, o bé --match / --vms-file")
 
     if a.parallel < 1:
         sys.exit("--parallel ha de ser 1 o més.")
@@ -292,12 +330,14 @@ def run():
 
     pve = Pve(resolve_hosts(a.hosts, a.hosts_file))
     if a.cmd == "list":
-        vms = pve.call("GET", "/cluster/resources")
-        for v in sorted((v for v in vms if v.get("type") in ("qemu", "lxc")), key=lambda v: v["vmid"]):
+        vms = [v for v in pve.call("GET", "/cluster/resources") if v.get("type") in ("qemu", "lxc")]
+        if a.match:  # a list, --match només filtra (mostra també les plantilles)
+            vms = [v for v in vms if any(fnmatch.fnmatchcase(v.get("name", ""), p) for p in a.match)]
+        for v in sorted(vms, key=lambda v: v["vmid"]):
             print(f"{v['vmid']:>6}  {v.get('name', '-'):<30} {v['type']:<5} {v.get('status', '?'):<9} {v['node']}")
         return
 
-    vms = pve.find_all(a.vm)
+    vms = pve.find_all(a.vm + (read_vms_file(a.vms_file) if a.vms_file else []), a.match or ())
     many = len(vms) > 1
     if many and a.cmd in DESTRUCTIVE and not a.yes:
         confirm_destructive(a.cmd, vms)

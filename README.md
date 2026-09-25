@@ -181,6 +181,46 @@ retorna l'UPID immediatament (l'opció va **abans** del subcomandament):
 ./pvectl.py --no-wait start web01
 ```
 
+### Seleccionar VMs per patró o per fitxer (`--match`, `--vms-file`)
+
+En lloc de llistar les VMs una per una, es poden triar per **patró** sobre el nom o per un
+**fitxer**. Són opcions globals (van **abans** del subcomandament) i es poden combinar entre elles
+i amb les VMs escrites a la línia d'ordres:
+
+```bash
+./pvectl.py --match 'k8s-*' status                       # totes les que comencen per k8s-
+./pvectl.py --match 'k8s-*' --parallel 4 --yes shutdown
+./pvectl.py --match 'web*' --match 'db*' start           # es pot repetir: unió dels patrons
+./pvectl.py --match 'web*' snapshot nocturn --keep 7     # amb --match, snapshot només necessita el NOM
+./pvectl.py --vms-file vms.txt status                    # una VM (nom o vmid) per línia
+./pvectl.py --vms-file vms.txt --match 'k8s-*' start web01
+./pvectl.py --match 'k8s-*' list                         # a list, només filtra la sortida
+```
+
+Exemple de `vms.txt` (les línies buides i els comentaris amb `#` s'ignoren):
+
+```
+# Servidors web
+web01
+web02
+105        # també es pot posar el vmid
+```
+
+- **Patrons:** de tipus shell (`*`, `?`, `[abc]`) que s'apliquen només al **nom** de la VM (no al
+  vmid) i **distingeixen majúscules i minúscules**. Han d'anar entre cometes perquè la shell no els
+  expandeixi (`'k8s-*'`, no `k8s-*`). Van ancorats a tot el nom: `k8s-*` no troba `Base-k8s-logs`;
+  per trobar-lo cal `*k8s*`.
+- **Les plantilles s'exclouen** de `--match` (no es poden arrencar ni fer-ne snapshot). Es poden
+  indicar igualment pel nom o pel vmid, i `list --match` les mostra.
+- **Tot o res:** si un patró no coincideix amb cap VM, o un nom del fitxer no existeix, no es fa res.
+- **Ordre:** primer les VMs indicades explícitament (línia d'ordres i fitxer) i després les dels
+  patrons, per vmid. Els duplicats es tracten com una sola VM.
+- **Seguretat:** un patró pot agafar més VMs de les previstes. Abans de fer-hi res destructiu,
+  comproveu-ho amb `--match 'patró' list` o `status`. `stop`, `reset`, `rollback` i `delsnap` sobre
+  més d'una VM demanen confirmació igualment (o `--yes`).
+- Amb `--match` o `--vms-file`, `snapshot`, `rollback` i `delsnap` només necessiten el **NOM** del
+  snapshot; si a més hi ha VMs a la línia d'ordres, l'últim argument continua sent el nom.
+
 ### Rotació de snapshots (`--keep`)
 
 Proxmox **no permet dos snapshots amb el mateix nom** a la mateixa VM (`snapshot name '...'
